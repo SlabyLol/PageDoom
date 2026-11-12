@@ -35,18 +35,20 @@
       image-rendering: pixelated;
       image-rendering: crisp-edges;
       outline: none;
+      display: block;
     }
+    canvas:not(:focus) { opacity: 0.85; }
+    canvas:focus { opacity: 1; }
     #status {
       position: absolute;
       top: 12px;
       left: 12px;
-      background: rgba(0,0,0,0.7);
+      background: rgba(0,0,0,0.75);
       padding: 6px 12px;
       border-radius: 6px;
       font-size: 14px;
       z-index: 20;
     }
-    /* Mobile controls */
     #mobile-controls {
       display: none;
       position: fixed;
@@ -100,12 +102,10 @@
       left: 50%;
       transform: translateX(-50%);
       font-size: 12px;
-      opacity: 0.6;
+      opacity: 0.55;
       text-align: center;
       pointer-events: none;
-    }
-    @media (min-width: 900px) {
-      #help { display: block; }
+      white-space: nowrap;
     }
   </style>
 </head>
@@ -113,7 +113,7 @@
   <div id="container">
     <div id="game-wrap">
       <div id="status">Loading Doom...</div>
-      <canvas id="screen" tabindex="0" width="640" height="400"></canvas>
+      <canvas id="screen" tabindex="0"></canvas>
     </div>
   </div>
 
@@ -131,18 +131,14 @@
     <button class="btn" id="menu">ESC</button>
   </div>
 
-  <div id="help">PC: Arrow keys / WASD · Ctrl = Fire · Space = Use · Shift = Run · Alt = Strafe</div>
+  <div id="help">PC: Arrows/WASD · Ctrl=Fire · Space=Use · Shift=Run · Alt=Strafe · Esc=Menu</div>
 
-  <script type="module">
-    // Simple Doom WASM runner with mobile + PC controls
-    // Uses the public wasm-doom package (based on classic linuxdoom)
-
+  <script>
     const canvas = document.getElementById('screen');
     const status = document.getElementById('status');
     const mobileControls = document.getElementById('mobile-controls');
 
-    // Detect mobile
-    const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || 
+    const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
                      (navigator.maxTouchPoints > 1 && window.innerWidth < 900);
 
     if (isMobile) {
@@ -150,140 +146,181 @@
       document.getElementById('help').style.display = 'none';
     }
 
-    // Key codes used by classic Doom
-    const KEY = {
-      LEFT:  0xac,
-      RIGHT: 0xae,
-      UP:    0xad,
-      DOWN:  0xaf,
-      FIRE:  0x80 + 0x1d, // Ctrl
-      USE:   32,         // Space
-      RUN:   0x80 + 0x36, // Shift
-      STRAFE:0x80 + 0x38, // Alt
-      ESC:   27,
-      ENTER: 13
-    };
-
-    let doom = null;
+    let moduleMemory = null;
+    let exports = null;
     let keysDown = new Set();
 
+    function readUtf8(ptr, len) {
+      const bytes = new Uint8Array(moduleMemory.buffer, ptr, len);
+      return new TextDecoder('utf-8').decode(bytes);
+    }
+
+    function onGameInit(width, height) {
+      canvas.width = width;
+      canvas.height = height;
+      status.style.display = 'none';
+      canvas.focus();
+    }
+
+    function drawFrame(frameBufferPtr) {
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      const src = new Uint8Array(moduleMemory.buffer, frameBufferPtr, w * h * 4);
+      const img = ctx.createImageData(w, h);
+
+      // Doom framebuffer is BGRA (little-endian ARGB) → convert to RGBA
+      for (let i = 0; i < w * h; i++) {
+        const s = i * 4;
+        img.data[s + 0] = src[s + 2]; // R
+        img.data[s + 1] = src[s + 1]; // G
+        img.data[s + 2] = src[s + 0]; // B
+        img.data[s + 3] = 255;        // A
+      }
+      ctx.putImageData(img, 0, 0);
+    }
+
+    function timeInMilliseconds() {
+      return BigInt(Math.trunc(performance.now()));
+    }
+
+    const imports = {
+      loading: {
+        onGameInit: onGameInit,
+        wadSizes: () => {},
+        readWads: () => {}
+      },
+      ui: {
+        drawFrame: drawFrame
+      },
+      runtimeControl: {
+        timeInMilliseconds: timeInMilliseconds
+      },
+      console: {
+        onInfoMessage: (ptr, len) => console.log('[Doom]', readUtf8(ptr, len)),
+        onErrorMessage: (ptr, len) => console.error('[Doom]', readUtf8(ptr, len))
+      },
+      gameSaving: {
+        sizeOfSaveGame: () => 0,
+        readSaveGame: () => 0,
+        writeSaveGame: () => 0
+      }
+    };
+
     function sendKey(down, code) {
-      if (!doom) return;
+      if (!exports) return;
       if (down) {
         if (!keysDown.has(code)) {
           keysDown.add(code);
-          doom.reportKeyDown?.(code) || doom.keyDown?.(code);
+          exports.reportKeyDown(code);
         }
       } else {
         if (keysDown.has(code)) {
           keysDown.delete(code);
-          doom.reportKeyUp?.(code) || doom.keyUp?.(code);
+          exports.reportKeyUp(code);
         }
       }
     }
 
     // Keyboard
-    window.addEventListener('keydown', e => {
+    function getDoomKey(e) {
+      if (!exports) return null;
       const map = {
-        ArrowLeft: KEY.LEFT, a: KEY.LEFT, A: KEY.LEFT,
-        ArrowRight: KEY.RIGHT, d: KEY.RIGHT, D: KEY.RIGHT,
-        ArrowUp: KEY.UP, w: KEY.UP, W: KEY.UP,
-        ArrowDown: KEY.DOWN, s: KEY.DOWN, S: KEY.DOWN,
-        Control: KEY.FIRE, ' ': KEY.USE,
-        Shift: KEY.RUN, Alt: KEY.STRAFE,
-        Escape: KEY.ESC, Enter: KEY.ENTER
+        ArrowLeft: exports.KEY_LEFTARROW,
+        ArrowRight: exports.KEY_RIGHTARROW,
+        ArrowUp: exports.KEY_UPARROW,
+        ArrowDown: exports.KEY_DOWNARROW,
+        a: exports.KEY_LEFTARROW, A: exports.KEY_LEFTARROW,
+        d: exports.KEY_RIGHTARROW, D: exports.KEY_RIGHTARROW,
+        w: exports.KEY_UPARROW, W: exports.KEY_UPARROW,
+        s: exports.KEY_DOWNARROW, S: exports.KEY_DOWNARROW,
+        Control: exports.KEY_FIRE,
+        ' ': exports.KEY_USE,
+        Shift: exports.KEY_SHIFT,
+        Alt: exports.KEY_ALT,
+        Escape: exports.KEY_ESCAPE,
+        Enter: exports.KEY_ENTER,
+        Tab: exports.KEY_TAB,
+        Backspace: exports.KEY_BACKSPACE,
+        ',': exports.KEY_STRAFE_L,
+        '.': exports.KEY_STRAFE_R
       };
-      if (map[e.key] !== undefined) {
+      if (map[e.key] !== undefined) return map[e.key];
+      if (e.key.length === 1) return e.key.charCodeAt(0);
+      return null;
+    }
+
+    canvas.addEventListener('keydown', e => {
+      const k = getDoomKey(e);
+      if (k !== null) {
         e.preventDefault();
-        sendKey(true, map[e.key]);
+        sendKey(true, k);
       }
     });
-    window.addEventListener('keyup', e => {
-      const map = {
-        ArrowLeft: KEY.LEFT, a: KEY.LEFT, A: KEY.LEFT,
-        ArrowRight: KEY.RIGHT, d: KEY.RIGHT, D: KEY.RIGHT,
-        ArrowUp: KEY.UP, w: KEY.UP, W: KEY.UP,
-        ArrowDown: KEY.DOWN, s: KEY.DOWN, S: KEY.DOWN,
-        Control: KEY.FIRE, ' ': KEY.USE,
-        Shift: KEY.RUN, Alt: KEY.STRAFE,
-        Escape: KEY.ESC, Enter: KEY.ENTER
-      };
-      if (map[e.key] !== undefined) {
+    canvas.addEventListener('keyup', e => {
+      const k = getDoomKey(e);
+      if (k !== null) {
         e.preventDefault();
-        sendKey(false, map[e.key]);
+        sendKey(false, k);
       }
     });
 
     // Mobile buttons
-    function bindBtn(id, code) {
+    function bindBtn(id, getCode) {
       const el = document.getElementById(id);
-      const down = (e) => { e.preventDefault(); el.classList.add('pressed'); sendKey(true, code); };
-      const up   = (e) => { e.preventDefault(); el.classList.remove('pressed'); sendKey(false, code); };
-      el.addEventListener('touchstart', down, {passive: false});
-      el.addEventListener('touchend', up, {passive: false});
-      el.addEventListener('touchcancel', up, {passive: false});
+      const down = (e) => {
+        e.preventDefault();
+        el.classList.add('pressed');
+        const code = getCode();
+        if (code != null) sendKey(true, code);
+      };
+      const up = (e) => {
+        e.preventDefault();
+        el.classList.remove('pressed');
+        const code = getCode();
+        if (code != null) sendKey(false, code);
+      };
+      el.addEventListener('touchstart', down, { passive: false });
+      el.addEventListener('touchend', up, { passive: false });
+      el.addEventListener('touchcancel', up, { passive: false });
       el.addEventListener('mousedown', down);
       el.addEventListener('mouseup', up);
       el.addEventListener('mouseleave', up);
     }
 
-    bindBtn('up', KEY.UP);
-    bindBtn('down', KEY.DOWN);
-    bindBtn('left', KEY.LEFT);
-    bindBtn('right', KEY.RIGHT);
-    bindBtn('fire', KEY.FIRE);
-    bindBtn('use', KEY.USE);
-    bindBtn('run', KEY.RUN);
-    bindBtn('strafe', KEY.STRAFE);
-    bindBtn('menu', KEY.ESC);
-
-    // Load the game
-    async function start() {
-      try {
-        status.textContent = 'Loading WASM...';
-
-        // Using the public wasm-doom package from jsDelivr
-        const { DOOM } = await import('https://cdn.jsdelivr.net/npm/wasm-doom@1.2.0/+esm');
-
-        const game = new DOOM({
-          screenWidth: 640,
-          screenHeight: 400,
-          keyboardTarget: canvas,
-          enableLogs: false,
-          onFrameRender: ({ imageData }) => {
-            const ctx = canvas.getContext('2d');
-            ctx.putImageData(imageData, 0, 0);
-          }
-        });
-
-        // Adapt the API
-        doom = {
-          reportKeyDown: (c) => game.keyDown?.(c),
-          reportKeyUp: (c) => game.keyUp?.(c),
-          keyDown: (c) => game.keyDown?.(c),
-          keyUp: (c) => game.keyUp?.(c)
-        };
-
-        status.textContent = 'Starting...';
-        await game.start();
-        status.style.display = 'none';
-        canvas.focus();
-
-      } catch (err) {
-        console.error(err);
-        status.textContent = 'Failed to load. Trying fallback...';
-
-        // Fallback message
-        status.innerHTML = `
-          <div style="max-width:320px;text-align:center;line-height:1.4">
-            <b>PageDoom</b><br><br>
-            WASM engine could not be loaded from CDN.<br><br>
-            You can still fork this repo and replace the engine with any local Doom WASM build (Chocolate Doom, wasmdoom, etc.).
-          </div>`;
-      }
+    // Bind after exports are ready
+    function setupMobile() {
+      bindBtn('up',    () => exports.KEY_UPARROW);
+      bindBtn('down',  () => exports.KEY_DOWNARROW);
+      bindBtn('left',  () => exports.KEY_LEFTARROW);
+      bindBtn('right', () => exports.KEY_RIGHTARROW);
+      bindBtn('fire',  () => exports.KEY_FIRE);
+      bindBtn('use',   () => exports.KEY_USE);
+      bindBtn('run',   () => exports.KEY_SHIFT);
+      bindBtn('strafe',() => exports.KEY_ALT);
+      bindBtn('menu',  () => exports.KEY_ESCAPE);
     }
 
-    start();
+    // Start
+    status.textContent = 'Loading WASM...';
+
+    WebAssembly.instantiateStreaming(fetch('doom-v0.1.0.wasm'), imports)
+      .then(({ instance }) => {
+        exports = instance.exports;
+        moduleMemory = exports.memory;
+
+        setupMobile();
+
+        status.textContent = 'Starting...';
+        exports.initGame();
+
+        // Doom runs at 35 FPS
+        setInterval(() => exports.tickGame(), 1000 / 35);
+      })
+      .catch(err => {
+        console.error(err);
+        status.innerHTML = 'Failed to load doom-v0.1.0.wasm<br><small>' + err.message + '</small>';
+      });
   </script>
 </body>
 </html>
